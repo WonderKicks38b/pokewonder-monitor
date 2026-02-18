@@ -1,11 +1,11 @@
 import os
 import json
 import time
-import hashlib
 import re
+import hashlib
 import requests
 from datetime import datetime, timezone
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
 # =====================
@@ -14,44 +14,51 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 CHAT_ID = os.environ["CHAT_ID"].strip()
 
-# =====================
-# CONFIG (safe defaults)
-# =====================
 STATE_FILE = "state.json"
 
+# =====================
+# TARGET PAGES
+# =====================
 PC_UK_HOME = "https://www.pokemoncenter.com/en-gb"
 PC_UK_TCG = "https://www.pokemoncenter.com/en-gb/category/trading-card-game"
 PC_UK_NEW = "https://www.pokemoncenter.com/en-gb/new-releases"
 
-# Optional: supply product URLs via GitHub secret/variable PRODUCT_URLS (comma-separated)
-# e.g. https://.../product/xxx,https://.../product/yyy
-PRODUCT_URLS_ENV = os.environ.get("PRODUCT_URLS", "").strip()
-PRODUCT_URLS = [u.strip() for u in PRODUCT_URLS_ENV.split(",") if u.strip()]
+# =====================
+# DEFAULT KEYWORDS (Option 5)
+# =====================
+DEFAULT_KEYWORDS = [
+    "elite trainer box", "etb",
+    "booster box", "booster display",
+    "booster bundle",
+    "booster pack",
+    "build & battle",
+    "collection box",
+    "premium collection",
+    "trainer toolkit",
+]
 
-# Every run schedule: alerts are rate-limited via state to avoid spam
-RE_ALERT_SECONDS = 60 * 60  # 1 hour general re-alert
-ERROR_RE_ALERT_SECONDS = 60 * 30  # 30 min for errors
-SNIPE_COOLDOWN_SECONDS = 60 * 5  # 5 min cooldown for "Add to cart detected" on same page
-
-# Wait-time threshold alerts (hours). Can override via WAIT_THRESHOLDS="6,3,1"
-WAIT_THRESHOLDS_ENV = os.environ.get("WAIT_THRESHOLDS", "").strip()
-if WAIT_THRESHOLDS_ENV:
-    try:
-        WAITTIME_THRESHOLDS_HOURS = [int(x.strip()) for x in WAIT_THRESHOLDS_ENV.split(",") if x.strip()]
-    except Exception:
-        WAITTIME_THRESHOLDS_HOURS = [6, 3, 1]
+# Optional override via repo secret KEYWORDS (comma-separated)
+# Example: elite trainer box,booster box,151,prismatic evolutions
+KEYWORDS_ENV = os.environ.get("KEYWORDS", "").strip()
+if KEYWORDS_ENV:
+    KEYWORDS = [k.strip().lower() for k in KEYWORDS_ENV.split(",") if k.strip()]
 else:
-    WAITTIME_THRESHOLDS_HOURS = [6, 3, 1]
+    KEYWORDS = [k.lower() for k in DEFAULT_KEYWORDS]
 
-# User agent
+# Rate limits (reduce spam)
+DAILY_ALIVE_KEY = "daily_alive_utc"
+ERROR_RE_ALERT_SECONDS = 30 * 60
+QUEUE_RE_ALERT_SECONDS = 60 * 60
+RESTOCK_COOLDOWN_SECONDS = 5 * 60
+NEW_ITEM_COOLDOWN_SECONDS = 10 * 60
+
+WAITTIME_THRESHOLDS_HOURS = [6, 3, 1]  # alerts when <= 6h, <= 3h, <= 1h
+
 UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 )
 
-# =====================
-# QUEUE / BLOCK DETECTION
-# =====================
 QUEUE_TEXT_HINTS = [
     "virtual queue",
     "you're in the virtual queue",
@@ -75,18 +82,15 @@ BLOCK_TEXT_HINTS = [
     "request blocked",
 ]
 
-
 # =====================
-# HELPERS
+# BASIC HELPERS
 # =====================
 def now_utc_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-
 def stable_key(*parts: str) -> str:
     s = "|".join(parts)
     return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()[:16]
-
 
 def load_state() -> dict:
     try:
@@ -95,11 +99,9 @@ def load_state() -> dict:
     except Exception:
         return {}
 
-
 def save_state(state: dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
-
 
 def tg_send(text: str) -> None:
     r = requests.post(
@@ -109,37 +111,21 @@ def tg_send(text: str) -> None:
     )
     print("Telegram sendMessage:", r.status_code, r.text[:200])
 
-
 def should_realert(state: dict, key: str, now_ts: int, window_seconds: int) -> bool:
-    last = state.get(key, {})
-    last_ts = int(last.get("last_alert_ts", 0) or 0)
+    last_ts = int(state.get(key, {}).get("last_alert_ts", 0) or 0)
     return (now_ts - last_ts) > window_seconds
 
-
 def parse_wait_time_seconds(text: str) -> Optional[int]:
-    """
-    Tries to parse:
-    - HH:MM:SS or H:MM:SS
-    - MM:SS
-    - Also catches "Estimated wait time : 06:36:00"
-    Returns seconds or None.
-    """
     t = " ".join((text or "").split())
-
-    # HH:MM:SS
     m = re.search(r"\b(\d{1,2}):(\d{2}):(\d{2})\b", t)
     if m:
         h = int(m.group(1)); mm = int(m.group(2)); ss = int(m.group(3))
         return h * 3600 + mm * 60 + ss
-
-    # MM:SS
     m = re.search(r"\b(\d{1,2}):(\d{2})\b", t)
     if m:
         mm = int(m.group(1)); ss = int(m.group(2))
         return mm * 60 + ss
-
     return None
-
 
 def detect_queue(final_url: str, body_text: str) -> Tuple[bool, str]:
     u = (final_url or "").lower()
@@ -150,7 +136,6 @@ def detect_queue(final_url: str, body_text: str) -> Tuple[bool, str]:
         return True, "Text matched queue hints"
     return False, "No queue hints"
 
-
 def detect_block(body_text: str) -> Tuple[bool, str]:
     t = (body_text or "").lower()
     for hint in BLOCK_TEXT_HINTS:
@@ -158,78 +143,30 @@ def detect_block(body_text: str) -> Tuple[bool, str]:
             return True, f"Block hint: '{hint}'"
     return False, "No block hints"
 
-
-def extract_title(html: str) -> str:
-    if not html:
-        return ""
-    m = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
-    if not m:
-        return ""
-    title = re.sub(r"\s+", " ", m.group(1)).strip()
-    return title[:120]
-
-
-def detect_stock_signals(html: str, body_text: str) -> Dict[str, bool]:
-    """
-    Minimal but useful heuristics.
-    We treat "add to cart/basket" as a strong restock signal.
-    """
-    t = (body_text or "").lower()
-    h = (html or "").lower()
-
-    out_of_stock = (
-        ("out of stock" in t) or ("sold out" in t) or
-        ("out of stock" in h) or ("sold out" in h)
-    )
-
-    add_to_cart = (
-        ("add to cart" in t) or ("add to basket" in t) or
-        ("add to cart" in h) or ("add to basket" in h)
-    )
-
-    return {"out_of_stock": out_of_stock, "add_to_cart": add_to_cart}
-
+def text_has_keywords(text: str) -> bool:
+    tt = (text or "").lower()
+    return any(k in tt for k in KEYWORDS)
 
 # =====================
-# PLAYWRIGHT FETCH (with smarter signals)
+# PLAYWRIGHT FETCH + EXTRACT
 # =====================
-def browser_fetch(url: str) -> Dict[str, Any]:
-    """
-    Returns:
-      final_url, body_text, html, first_url, response_status (best-effort)
-    """
+def fetch_page(url: str) -> Dict[str, Any]:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(user_agent=UA)
         page = context.new_page()
 
-        first_url = url
-        response_status = None
-
-        def on_response(resp):
-            nonlocal response_status
-            # capture first main-document-ish status
-            try:
-                if resp.request.resource_type == "document" and response_status is None:
-                    response_status = resp.status
-            except Exception:
-                pass
-
-        page.on("response", on_response)
-
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
-
-        # give it a moment for redirects/queue scripts
         try:
             page.wait_for_load_state("networkidle", timeout=20000)
         except PWTimeoutError:
             pass
 
         final_url = page.url
+
         body_text = ""
         try:
-            if page.locator("body").count():
-                body_text = page.inner_text("body")
+            body_text = page.inner_text("body")
         except Exception:
             body_text = ""
 
@@ -239,230 +176,290 @@ def browser_fetch(url: str) -> Dict[str, Any]:
         except Exception:
             html = ""
 
+        # Extract product-like items from the DOM robustly:
+        # - find <a href*="/product/">
+        # - capture href + link text + nearby container text (best-effort)
+        items = page.evaluate(
+            """
+            () => {
+              function norm(s){
+                return (s || "").replace(/\\s+/g," ").trim();
+              }
+
+              const anchors = Array.from(document.querySelectorAll('a[href*="/product/"]'));
+              const results = [];
+              const seen = new Set();
+
+              for (const a of anchors) {
+                const href = a.getAttribute("href") || "";
+                if (!href.includes("/product/")) continue;
+
+                // build absolute url
+                const url = new URL(href, window.location.origin).toString();
+
+                // de-dupe
+                const key = url;
+                if (seen.has(key)) continue;
+                seen.add(key);
+
+                const linkText = norm(a.innerText);
+
+                // attempt to find a reasonable card/container
+                let container = a.closest('li, article, div');
+                let containerText = "";
+                if (container) {
+                  containerText = norm(container.innerText);
+                  // keep it bounded
+                  if (containerText.length > 500) containerText = containerText.slice(0, 500);
+                }
+
+                results.push({
+                  url,
+                  linkText,
+                  containerText
+                });
+              }
+
+              return results;
+            }
+            """
+        )
+
         context.close()
         browser.close()
 
         return {
-            "first_url": first_url,
             "final_url": final_url,
-            "response_status": response_status,
             "body_text": body_text,
             "html": html,
+            "items": items or [],
         }
 
+# =====================
+# INTELLIGENCE: classify + infer stock
+# =====================
+def infer_in_stock(text_blob: str) -> Optional[bool]:
+    """
+    Very safe inference from visible text around the product card.
+    Returns:
+      True  -> strong in-stock signal
+      False -> strong out-of-stock signal
+      None  -> unknown
+    """
+    t = (text_blob or "").lower()
+
+    # Strong OOS signals
+    if "out of stock" in t or "sold out" in t or "unavailable" in t:
+        return False
+
+    # Strong in-stock / purchase signals
+    if "add to cart" in t or "add to basket" in t:
+        return True
+
+    # Sometimes just "add" appears
+    if re.search(r"\badd to\b", t):
+        return True
+
+    return None
+
+def product_kind(text_blob: str) -> str:
+    t = (text_blob or "").lower()
+    if "elite trainer box" in t or re.search(r"\betb\b", t):
+        return "ETB"
+    if "booster box" in t or "booster display" in t:
+        return "Booster Box"
+    if "booster bundle" in t:
+        return "Booster Bundle"
+    if "booster pack" in t or "booster" in t:
+        return "Booster"
+    if "build & battle" in t:
+        return "Build & Battle"
+    if "collection" in t:
+        return "Collection"
+    return "TCG Item"
 
 # =====================
-# ALERT LOGIC
+# ALERTS
 # =====================
 def daily_alive(state: dict, now_ts: int) -> None:
-    """
-    Upgrade #1: Alive message daily only (UTC).
-    """
-    key = "daily_alive_utc"
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if state.get(key) != today:
+    if state.get(DAILY_ALIVE_KEY) != today:
         tg_send(f"🟢 PokeWonder operational — {today}")
-        state[key] = today
+        state[DAILY_ALIVE_KEY] = today
         state.setdefault("_meta", {})["last_alive_ts"] = now_ts
 
+def queue_alerts(state: dict, now_ts: int, name: str, url: str, final_url: str, body_text: str) -> None:
+    key = stable_key("queue", url)
+    prev = state.get(key, {}).get("status", "UNKNOWN")
 
-def queue_alerts(state: dict, now_ts: int, name: str, source_url: str, final_url: str, body_text: str) -> None:
-    """
-    Upgrade #3: Better queue intelligence + wait-time thresholds + status change.
-    """
-    key = stable_key("queue", source_url)
-    prev_status = state.get(key, {}).get("status", "UNKNOWN")
+    q, q_reason = detect_queue(final_url, body_text)
+    b, b_reason = detect_block(body_text)
+    status = "QUEUE" if q else ("BLOCK" if b else "OK")
 
-    is_q, q_reason = detect_queue(final_url, body_text)
-    is_b, b_reason = detect_block(body_text)
-
-    status = "QUEUE" if is_q else ("BLOCK" if is_b else "OK")
     state.setdefault(key, {})
-    state[key].update({
-        "status": status,
-        "final_url": final_url,
-        "last_seen_ts": now_ts,
-    })
+    state[key].update({"status": status, "final_url": final_url, "last_seen_ts": now_ts})
 
-    # Status transition alerts (high value, low noise)
-    if status != prev_status:
+    if status != prev:
         if status == "QUEUE":
-            tg_send(
-                f"🚨 QUEUE DETECTED\nTime: {now_utc_str()}\nSource: {name}\nLink: {final_url}\nReason: {q_reason}"
-            )
+            tg_send(f"🚨 QUEUE DETECTED\nTime: {now_utc_str()}\nSource: {name}\nLink: {final_url}\nReason: {q_reason}")
             state[key]["last_alert_ts"] = now_ts
 
         elif status == "BLOCK":
-            # Don't spam blocks; rate-limit
             if should_realert(state, key, now_ts, ERROR_RE_ALERT_SECONDS):
-                tg_send(
-                    f"🧱 POSSIBLE BLOCK/CAPTCHA\nTime: {now_utc_str()}\nSource: {name}\nLink: {final_url}\nReason: {b_reason}"
-                )
+                tg_send(f"🧱 POSSIBLE BLOCK/CAPTCHA\nTime: {now_utc_str()}\nSource: {name}\nLink: {final_url}\nReason: {b_reason}")
                 state[key]["last_alert_ts"] = now_ts
 
-        elif status == "OK" and prev_status == "QUEUE":
-            tg_send(
-                f"✅ QUEUE CLEARED\nTime: {now_utc_str()}\nSource: {name}\nLink: {final_url}"
-            )
+        elif status == "OK" and prev == "QUEUE":
+            tg_send(f"✅ QUEUE CLEARED\nTime: {now_utc_str()}\nSource: {name}\nLink: {final_url}")
             state[key]["last_alert_ts"] = now_ts
 
-    # Wait-time thresholds (only when QUEUE)
+    # Wait time thresholds only when queue
     if status == "QUEUE":
-        wait_seconds = parse_wait_time_seconds(body_text)
-        if wait_seconds is not None:
-            hours = wait_seconds / 3600.0
-
-            th_key = stable_key("wait_thresholds", source_url)
+        wait_s = parse_wait_time_seconds(body_text)
+        if wait_s is not None:
+            hours = wait_s / 3600.0
+            th_key = stable_key("wait_th", url)
             passed = set(state.get(th_key, {}).get("passed", []))
-
-            for th in sorted(WAITTIME_THRESHOLDS_HOURS, reverse=True):
-                # alert when it drops BELOW threshold for first time
+            for th in WAITTIME_THRESHOLDS_HOURS:
                 if hours <= th and str(th) not in passed:
                     tg_send(
                         f"⏱ WAIT TIME DROP\nTime: {now_utc_str()}\nSource: {name}\nWait: ~{hours:.2f}h (<= {th}h)\nLink: {final_url}"
                     )
                     passed.add(str(th))
-
             state[th_key] = {"passed": sorted(list(passed)), "last_seen_ts": now_ts}
 
-        # Optional re-alert if queue stays active forever (hourly)
-        if should_realert(state, stable_key("queue_realert", source_url), now_ts, RE_ALERT_SECONDS):
-            tg_send(
-                f"🔁 QUEUE STILL ACTIVE\nTime: {now_utc_str()}\nSource: {name}\nLink: {final_url}"
-            )
-            state[stable_key("queue_realert", source_url)] = {"last_alert_ts": now_ts}
+        # Re-alert hourly if queue remains active
+        realert_key = stable_key("queue_re", url)
+        if should_realert(state, realert_key, now_ts, QUEUE_RE_ALERT_SECONDS):
+            tg_send(f"🔁 QUEUE STILL ACTIVE\nTime: {now_utc_str()}\nSource: {name}\nLink: {final_url}")
+            state[realert_key] = {"last_alert_ts": now_ts}
 
-
-def stock_alerts(
-    state: dict,
-    now_ts: int,
-    name: str,
-    source_url: str,
-    final_url: str,
-    body_text: str,
-    html: str,
-    is_product: bool,
-) -> None:
+def scan_and_alert_intel(state: dict, now_ts: int, page_name: str, page_url: str, extracted_items: List[Dict[str, str]]) -> None:
     """
-    Upgrade #2: Noise reduction.
-      - For categories: only alert on strong signals (add_to_cart appearing) or major signature changes (rare).
-      - For products: alert on add_to_cart and out_of_stock->false transitions.
-    Upgrade #4: Sniping mode.
-      - "Add to cart detected" sends immediately with cooldown.
+    Core intelligence scanner:
+    - Filters items by KEYWORDS
+    - Tracks item status in state
+    - Alerts on:
+      NEW matching item
+      RESTOCK (was out_of_stock, now in_stock)
+      ADD TO CART detected (sniping signal)
     """
-    key = stable_key("stock", source_url)
-    prev = state.get(key, {})
-    prev_signals = prev.get("signals", {})
-    prev_add = bool(prev_signals.get("add_to_cart", False))
-    prev_oos = bool(prev_signals.get("out_of_stock", False))
+    items_state = state.setdefault("items", {})  # url -> record
 
-    signals = detect_stock_signals(html, body_text)
-    add_to_cart = signals["add_to_cart"]
-    out_of_stock = signals["out_of_stock"]
+    for it in extracted_items:
+        url = (it.get("url") or "").strip()
+        link_text = (it.get("linkText") or "").strip()
+        container_text = (it.get("containerText") or "").strip()
 
-    title = extract_title(html)
+        if not url:
+            continue
 
-    # Build a conservative signature (reduces noise):
-    # - We do NOT hash full HTML.
-    # - We hash just these booleans + title.
-    sig = stable_key(str(add_to_cart), str(out_of_stock), title)
+        blob = f"{link_text}\n{container_text}"
+        if not text_has_keywords(blob):
+            continue  # not relevant to ETB/Booster etc
 
-    # Store baseline
-    first_seen = prev.get("sig") is None
-    state[key] = {
-        "sig": sig,
-        "signals": signals,
-        "final_url": final_url,
-        "last_seen_ts": now_ts,
-        "last_alert_ts": prev.get("last_alert_ts", 0),
-        "title": title,
-    }
+        kind = product_kind(blob)
+        stock_guess = infer_in_stock(blob)  # True/False/None
 
-    # -------------------
-    # SNIPE: Add-to-cart detected (strong)
-    # -------------------
-    if add_to_cart:
-        last_alert = int(state[key].get("last_alert_ts", 0) or 0)
-        if (now_ts - last_alert) > SNIPE_COOLDOWN_SECONDS:
-            tg_send(
-                f"🟢 ADD TO CART DETECTED (SNIPE)\n"
-                f"Time: {now_utc_str()}\n"
-                f"Target: {name}\n"
-                f"Title: {title or 'N/A'}\n"
-                f"Link: {final_url}"
-            )
-            state[key]["last_alert_ts"] = now_ts
-        return  # if add-to-cart is true we don't need other noisy alerts
+        # Build signature to detect meaningful changes without HTML noise
+        sig = stable_key(link_text.lower()[:200], container_text.lower()[:400])
 
-    # -------------------
-    # PRODUCT: out_of_stock -> not out_of_stock (restock hint)
-    # -------------------
-    if is_product and prev_oos and (not out_of_stock) and (not first_seen):
-        tg_send(
-            f"📦 RESTOCK SIGNAL (OOS cleared)\n"
-            f"Time: {now_utc_str()}\n"
-            f"Target: {name}\n"
-            f"Title: {title or 'N/A'}\n"
-            f"Link: {final_url}"
-        )
-        state[key]["last_alert_ts"] = now_ts
-        return
+        prev = items_state.get(url, {})
+        prev_sig = prev.get("sig")
+        prev_stock = prev.get("stock")  # True/False/None
 
-    # -------------------
-    # CATEGORY: only alert if add-to-cart appears (handled above) or major signature change
-    # PRODUCT: optionally alert on major signature changes too
-    # -------------------
-    prev_sig = prev.get("sig")
-    if (not first_seen) and prev_sig and prev_sig != sig:
-        # Noise reduction:
-        # - categories: do NOT alert for small changes unless this is a product page
-        if is_product:
-            tg_send(
-                f"🧩 PRODUCT PAGE CHANGED\n"
-                f"Time: {now_utc_str()}\n"
-                f"Target: {name}\n"
-                f"Title: {title or 'N/A'}\n"
-                f"Link: {final_url}\n"
-                f"Now: out_of_stock={out_of_stock} | add_to_cart={add_to_cart}"
-            )
-            state[key]["last_alert_ts"] = now_ts
-        else:
-            # categories: silence; just keep baseline updated
-            pass
+        first_seen = (url not in items_state)
 
+        # Update state first
+        items_state[url] = {
+            "sig": sig,
+            "title": link_text[:200],
+            "kind": kind,
+            "stock": stock_guess,
+            "last_seen_ts": now_ts,
+            "source_page": page_url,
+            "source_name": page_name,
+            "last_alert_ts": prev.get("last_alert_ts", 0),
+        }
+
+        # --- Alert: NEW matching item (low spam, cooldown per item) ---
+        if first_seen:
+            # Only alert if it looks purchaseable OR unknown (new listings matter)
+            last_alert = int(items_state[url].get("last_alert_ts", 0) or 0)
+            if (now_ts - last_alert) > NEW_ITEM_COOLDOWN_SECONDS:
+                tg_send(
+                    f"🆕 NEW MATCHING LISTING\n"
+                    f"Time: {now_utc_str()}\n"
+                    f"Type: {kind}\n"
+                    f"Title: {link_text or 'N/A'}\n"
+                    f"Stock: {stock_guess}\n"
+                    f"Link: {url}\n"
+                    f"Found on: {page_name}"
+                )
+                items_state[url]["last_alert_ts"] = now_ts
+            continue
+
+        # --- Alert: RESTOCK signal (was False, now True) ---
+        if prev_stock is False and stock_guess is True:
+            last_alert = int(items_state[url].get("last_alert_ts", 0) or 0)
+            if (now_ts - last_alert) > RESTOCK_COOLDOWN_SECONDS:
+                tg_send(
+                    f"📦 RESTOCK SIGNAL\n"
+                    f"Time: {now_utc_str()}\n"
+                    f"Type: {kind}\n"
+                    f"Title: {link_text or 'N/A'}\n"
+                    f"Link: {url}\n"
+                    f"Source: {page_name}"
+                )
+                items_state[url]["last_alert_ts"] = now_ts
+            continue
+
+        # --- Alert: SNIPING signal if card shows Add to cart/basket ---
+        if stock_guess is True and (prev_stock is not True):
+            # treat as "became buyable"
+            last_alert = int(items_state[url].get("last_alert_ts", 0) or 0)
+            if (now_ts - last_alert) > RESTOCK_COOLDOWN_SECONDS:
+                tg_send(
+                    f"🟢 BUYABLE NOW (Add-to-cart detected)\n"
+                    f"Time: {now_utc_str()}\n"
+                    f"Type: {kind}\n"
+                    f"Title: {link_text or 'N/A'}\n"
+                    f"Link: {url}\n"
+                    f"Source: {page_name}"
+                )
+                items_state[url]["last_alert_ts"] = now_ts
+            continue
+
+        # We intentionally do NOT alert on minor signature changes for categories
+        # (noise reduction). We only care about new listings + stock transitions.
 
 def main():
     now_ts = int(time.time())
     state = load_state()
 
-    # Upgrade #1: daily-only alive message
+    # Daily alive (once per day)
     daily_alive(state, now_ts)
 
-    # Targets
-    category_targets = [
+    targets = [
         ("PC UK Home", PC_UK_HOME),
         ("PC UK TCG Category", PC_UK_TCG),
         ("PC UK New Releases", PC_UK_NEW),
     ]
-    product_targets = [(f"Product {i}", u) for i, u in enumerate(PRODUCT_URLS, start=1)]
 
-    # If user hasn't provided product URLs yet, still run categories
-    targets = [(n, u, False) for (n, u) in category_targets] + [(n, u, True) for (n, u) in product_targets]
-
-    for name, url, is_product in targets:
+    for name, url in targets:
         try:
-            res = browser_fetch(url)
+            res = fetch_page(url)
             final_url = res["final_url"]
             body_text = res["body_text"]
-            html = res["html"]
+            items = res["items"] or []
 
-            # Upgrade #3: advanced queue detection + wait-time thresholds + block detection
+            # Queue intelligence
             queue_alerts(state, now_ts, name, url, final_url, body_text)
 
-            # Upgrade #2 + #4: noise-reduced stock alerts + sniping mode
-            stock_alerts(state, now_ts, name, url, final_url, body_text, html, is_product=is_product)
+            # Category intelligence scanner
+            scan_and_alert_intel(state, now_ts, name, url, items)
 
-            print(f"Checked {name} OK -> {final_url}")
+            print(f"OK: {name} -> {final_url} items={len(items)}")
 
         except Exception as e:
             err_key = stable_key("error", url)
@@ -478,7 +475,6 @@ def main():
             print("Error:", name, e)
 
     save_state(state)
-
 
 if __name__ == "__main__":
     main()
