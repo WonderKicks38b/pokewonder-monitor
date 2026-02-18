@@ -5,6 +5,10 @@ on:
   schedule:
     - cron: "*/5 * * * *"
 
+concurrency:
+  group: pokewonder-monitor
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
@@ -33,6 +37,11 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          # OPTIONAL:
+          # Put product URLs (comma-separated) in a repo secret named PRODUCT_URLS if you want true restock sniping
+          PRODUCT_URLS: ${{ secrets.PRODUCT_URLS }}
+          # OPTIONAL: override wait-time thresholds (hours)
+          WAIT_THRESHOLDS: ${{ secrets.WAIT_THRESHOLDS }}
 
       - name: Save state
         run: |
