@@ -2,32 +2,56 @@ import os
 import json
 import time
 import hashlib
+import re
 import requests
 from datetime import datetime, timezone
-from playwright.sync_api import sync_playwright
+from typing import Optional, Tuple, Dict, Any, List
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
+# =====================
+# REQUIRED SECRETS
+# =====================
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 CHAT_ID = os.environ["CHAT_ID"].strip()
 
+# =====================
+# CONFIG (safe defaults)
+# =====================
 STATE_FILE = "state.json"
 
-# --- What we monitor ---
 PC_UK_HOME = "https://www.pokemoncenter.com/en-gb"
 PC_UK_TCG = "https://www.pokemoncenter.com/en-gb/category/trading-card-game"
 PC_UK_NEW = "https://www.pokemoncenter.com/en-gb/new-releases"
 
-# Add product URLs you care about (paste real product pages here)
-PRODUCT_URLS = [
-    # "https://www.pokemoncenter.com/en-gb/product/....",
-]
+# Optional: supply product URLs via GitHub secret/variable PRODUCT_URLS (comma-separated)
+# e.g. https://.../product/xxx,https://.../product/yyy
+PRODUCT_URLS_ENV = os.environ.get("PRODUCT_URLS", "").strip()
+PRODUCT_URLS = [u.strip() for u in PRODUCT_URLS_ENV.split(",") if u.strip()]
 
-# How often we re-alert if something stays "ON" (prevents spam)
-RE_ALERT_SECONDS = 60 * 60  # 1 hour
+# Every run schedule: alerts are rate-limited via state to avoid spam
+RE_ALERT_SECONDS = 60 * 60  # 1 hour general re-alert
+ERROR_RE_ALERT_SECONDS = 60 * 30  # 30 min for errors
+SNIPE_COOLDOWN_SECONDS = 60 * 5  # 5 min cooldown for "Add to cart detected" on same page
 
-# Wait-time alerts (hours)
-WAITTIME_THRESHOLDS_HOURS = [6, 3, 1]  # alert when <= 6h, <= 3h, <= 1h
+# Wait-time threshold alerts (hours). Can override via WAIT_THRESHOLDS="6,3,1"
+WAIT_THRESHOLDS_ENV = os.environ.get("WAIT_THRESHOLDS", "").strip()
+if WAIT_THRESHOLDS_ENV:
+    try:
+        WAITTIME_THRESHOLDS_HOURS = [int(x.strip()) for x in WAIT_THRESHOLDS_ENV.split(",") if x.strip()]
+    except Exception:
+        WAITTIME_THRESHOLDS_HOURS = [6, 3, 1]
+else:
+    WAITTIME_THRESHOLDS_HOURS = [6, 3, 1]
 
-# Queue detection hints (text + URL)
+# User agent
+UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+)
+
+# =====================
+# QUEUE / BLOCK DETECTION
+# =====================
 QUEUE_TEXT_HINTS = [
     "virtual queue",
     "you're in the virtual queue",
@@ -36,27 +60,27 @@ QUEUE_TEXT_HINTS = [
     "do not refresh",
     "lose your place in line",
     "high volume of requests",
+    "waiting room",
 ]
 QUEUE_URL_HINTS = ["queue-it", "virtual-queue", "queue", "waiting", "line"]
 
-UA = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-)
+BLOCK_TEXT_HINTS = [
+    "access denied",
+    "are you a robot",
+    "unusual traffic",
+    "captcha",
+    "verify you are human",
+    "temporarily unavailable",
+    "service unavailable",
+    "request blocked",
+]
 
 
-def now_utc_str():
+# =====================
+# HELPERS
+# =====================
+def now_utc_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
-def tg_send(text: str) -> None:
-    r = requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": text},
-        timeout=20,
-    )
-    # Print for logs (safe)
-    print("Telegram sendMessage:", r.status_code, r.text[:200])
 
 
 def stable_key(*parts: str) -> str:
@@ -77,42 +101,47 @@ def save_state(state: dict) -> None:
         json.dump(state, f, indent=2)
 
 
-def parse_wait_time_seconds(text: str) -> int | None:
+def tg_send(text: str) -> None:
+    r = requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        data={"chat_id": CHAT_ID, "text": text},
+        timeout=20,
+    )
+    print("Telegram sendMessage:", r.status_code, r.text[:200])
+
+
+def should_realert(state: dict, key: str, now_ts: int, window_seconds: int) -> bool:
+    last = state.get(key, {})
+    last_ts = int(last.get("last_alert_ts", 0) or 0)
+    return (now_ts - last_ts) > window_seconds
+
+
+def parse_wait_time_seconds(text: str) -> Optional[int]:
     """
-    Attempts to parse wait time formats commonly seen:
-    - 06:36:00
-    - 1:05:00
-    - 15:20
-    - "Estimated wait time : 06:36:00"
+    Tries to parse:
+    - HH:MM:SS or H:MM:SS
+    - MM:SS
+    - Also catches "Estimated wait time : 06:36:00"
     Returns seconds or None.
     """
-    t = " ".join(text.split())
-    # find a token that looks like H:MM:SS or HH:MM:SS or MM:SS
-    import re
+    t = " ".join((text or "").split())
 
-    candidates = re.findall(r"\b(\d{1,2}):(\d{2})(?::(\d{2}))?\b", t)
-    if not candidates:
-        return None
+    # HH:MM:SS
+    m = re.search(r"\b(\d{1,2}):(\d{2}):(\d{2})\b", t)
+    if m:
+        h = int(m.group(1)); mm = int(m.group(2)); ss = int(m.group(3))
+        return h * 3600 + mm * 60 + ss
 
-    # take the first match
-    h, m, s = candidates[0]
-    h = int(h)
-    m = int(m)
-    if s is None or s == "":
-        sec = 0
-    else:
-        sec = int(s)
-        # if pattern was MM:SS, h is actually minutes
-        # But our regex uses h:m(:s). If only two groups -> treat as MM:SS.
-    if len(candidates[0]) == 3 and candidates[0][2] is not None:
-        # H:MM:SS or HH:MM:SS
-        return h * 3600 + m * 60 + sec
-    else:
-        # MM:SS
-        return h * 60 + m
+    # MM:SS
+    m = re.search(r"\b(\d{1,2}):(\d{2})\b", t)
+    if m:
+        mm = int(m.group(1)); ss = int(m.group(2))
+        return mm * 60 + ss
+
+    return None
 
 
-def is_queue(final_url: str, body_text: str) -> tuple[bool, str]:
+def detect_queue(final_url: str, body_text: str) -> Tuple[bool, str]:
     u = (final_url or "").lower()
     t = (body_text or "").lower()
     if any(h in u for h in QUEUE_URL_HINTS):
@@ -122,191 +151,322 @@ def is_queue(final_url: str, body_text: str) -> tuple[bool, str]:
     return False, "No queue hints"
 
 
-def should_realert(state: dict, key: str, now_ts: int) -> bool:
-    last = state.get(key, {})
-    last_ts = int(last.get("last_alert_ts", 0) or 0)
-    return (now_ts - last_ts) > RE_ALERT_SECONDS
+def detect_block(body_text: str) -> Tuple[bool, str]:
+    t = (body_text or "").lower()
+    for hint in BLOCK_TEXT_HINTS:
+        if hint in t:
+            return True, f"Block hint: '{hint}'"
+    return False, "No block hints"
 
 
-def browser_fetch(url: str) -> dict:
+def extract_title(html: str) -> str:
+    if not html:
+        return ""
+    m = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+    if not m:
+        return ""
+    title = re.sub(r"\s+", " ", m.group(1)).strip()
+    return title[:120]
+
+
+def detect_stock_signals(html: str, body_text: str) -> Dict[str, bool]:
+    """
+    Minimal but useful heuristics.
+    We treat "add to cart/basket" as a strong restock signal.
+    """
+    t = (body_text or "").lower()
+    h = (html or "").lower()
+
+    out_of_stock = (
+        ("out of stock" in t) or ("sold out" in t) or
+        ("out of stock" in h) or ("sold out" in h)
+    )
+
+    add_to_cart = (
+        ("add to cart" in t) or ("add to basket" in t) or
+        ("add to cart" in h) or ("add to basket" in h)
+    )
+
+    return {"out_of_stock": out_of_stock, "add_to_cart": add_to_cart}
+
+
+# =====================
+# PLAYWRIGHT FETCH (with smarter signals)
+# =====================
+def browser_fetch(url: str) -> Dict[str, Any]:
+    """
+    Returns:
+      final_url, body_text, html, first_url, response_status (best-effort)
+    """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(user_agent=UA)
         page = context.new_page()
 
-        page.goto(url, wait_until="networkidle", timeout=60000)
+        first_url = url
+        response_status = None
+
+        def on_response(resp):
+            nonlocal response_status
+            # capture first main-document-ish status
+            try:
+                if resp.request.resource_type == "document" and response_status is None:
+                    response_status = resp.status
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+
+        # give it a moment for redirects/queue scripts
+        try:
+            page.wait_for_load_state("networkidle", timeout=20000)
+        except PWTimeoutError:
+            pass
 
         final_url = page.url
-        body_text = page.inner_text("body") if page.locator("body").count() else ""
-        html = page.content()
+        body_text = ""
+        try:
+            if page.locator("body").count():
+                body_text = page.inner_text("body")
+        except Exception:
+            body_text = ""
+
+        html = ""
+        try:
+            html = page.content()
+        except Exception:
+            html = ""
 
         context.close()
         browser.close()
 
-        return {"final_url": final_url, "body_text": body_text, "html": html}
+        return {
+            "first_url": first_url,
+            "final_url": final_url,
+            "response_status": response_status,
+            "body_text": body_text,
+            "html": html,
+        }
 
 
-def detect_stock_signals(html: str, body_text: str) -> dict:
+# =====================
+# ALERT LOGIC
+# =====================
+def daily_alive(state: dict, now_ts: int) -> None:
     """
-    Lightweight, generic product/category detection:
-    - looks for 'out of stock' and 'add to cart' style signals.
-    This is heuristic; we can harden later per-page.
+    Upgrade #1: Alive message daily only (UTC).
     """
-    t = (body_text or "").lower()
-    h = (html or "").lower()
-
-    out_of_stock = ("out of stock" in t) or ("out of stock" in h) or ("sold out" in t) or ("sold out" in h)
-    add_to_cart = ("add to cart" in t) or ("add to basket" in t) or ("add to cart" in h) or ("add to basket" in h)
-
-    return {
-        "out_of_stock": out_of_stock,
-        "add_to_cart": add_to_cart,
-    }
+    key = "daily_alive_utc"
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if state.get(key) != today:
+        tg_send(f"🟢 PokeWonder operational — {today}")
+        state[key] = today
+        state.setdefault("_meta", {})["last_alive_ts"] = now_ts
 
 
-def alert_queue_changes(state: dict, now_ts: int, name: str, url: str, final_url: str, body_text: str):
-    key = stable_key("queue", url)
-    was = state.get(key, {}).get("status", "UNKNOWN")
+def queue_alerts(state: dict, now_ts: int, name: str, source_url: str, final_url: str, body_text: str) -> None:
+    """
+    Upgrade #3: Better queue intelligence + wait-time thresholds + status change.
+    """
+    key = stable_key("queue", source_url)
+    prev_status = state.get(key, {}).get("status", "UNKNOWN")
 
-    queue, reason = is_queue(final_url, body_text)
-    wait_seconds = parse_wait_time_seconds(body_text) if queue else None
+    is_q, q_reason = detect_queue(final_url, body_text)
+    is_b, b_reason = detect_block(body_text)
 
-    # Always store latest snapshot
+    status = "QUEUE" if is_q else ("BLOCK" if is_b else "OK")
     state.setdefault(key, {})
-    state[key]["status"] = "QUEUE" if queue else "OK"
-    state[key]["final_url"] = final_url
-    state[key]["last_seen_ts"] = now_ts
+    state[key].update({
+        "status": status,
+        "final_url": final_url,
+        "last_seen_ts": now_ts,
+    })
 
-    # Status change alerts
-    if queue and was != "QUEUE":
-        tg_send(
-            f"🚨 QUEUE DETECTED\n"
-            f"Time: {now_utc_str()}\n"
-            f"Source: {name}\n"
-            f"Link: {final_url}\n"
-            f"Reason: {reason}"
-        )
-        state[key]["last_alert_ts"] = now_ts
-
-    if (not queue) and was == "QUEUE":
-        tg_send(
-            f"✅ QUEUE CLEARED\n"
-            f"Time: {now_utc_str()}\n"
-            f"Source: {name}\n"
-            f"Link: {final_url}"
-        )
-        state[key]["last_alert_ts"] = now_ts
-
-    # Wait-time threshold alerts (only when queue is on)
-    if queue and wait_seconds is not None:
-        hours = wait_seconds / 3600.0
-        thresholds_key = stable_key("wait_thresholds", url)
-        passed = set(state.get(thresholds_key, {}).get("passed", []))
-
-        for th in WAITTIME_THRESHOLDS_HOURS:
-            if hours <= th and str(th) not in passed:
-                tg_send(
-                    f"⏱ WAIT TIME DROP\n"
-                    f"Time: {now_utc_str()}\n"
-                    f"Source: {name}\n"
-                    f"Wait: ~{hours:.2f}h (<= {th}h)\n"
-                    f"Link: {final_url}"
-                )
-                passed.add(str(th))
-
-        state[thresholds_key] = {"passed": sorted(list(passed)), "last_seen_ts": now_ts}
-
-    # Re-alert if queue stays on forever (optional)
-    if queue and should_realert(state, key, now_ts):
-        tg_send(
-            f"🔁 QUEUE STILL ACTIVE\n"
-            f"Time: {now_utc_str()}\n"
-            f"Source: {name}\n"
-            f"Link: {final_url}"
-        )
-        state[key]["last_alert_ts"] = now_ts
-
-
-def alert_stock_changes(state: dict, now_ts: int, name: str, url: str, final_url: str, body_text: str, html: str):
-    key = stable_key("stock", url)
-
-    signals = detect_stock_signals(html, body_text)
-    signature = stable_key(str(signals["out_of_stock"]), str(signals["add_to_cart"]))
-
-    prev_sig = state.get(key, {}).get("sig")
-
-    # Alert on change
-    if prev_sig is not None and prev_sig != signature:
-        tg_send(
-            f"📦 STOCK PAGE CHANGE\n"
-            f"Time: {now_utc_str()}\n"
-            f"Page: {name}\n"
-            f"Link: {final_url}\n"
-            f"Now: out_of_stock={signals['out_of_stock']} | add_to_cart={signals['add_to_cart']}"
-        )
-        state[key]["last_alert_ts"] = now_ts
-
-    # First time baseline: optionally send nothing
-    if prev_sig is None:
-        print(f"Baseline set for {name}: {signals}")
-
-    # Special: if add_to_cart becomes true, alert immediately
-    if signals["add_to_cart"]:
-        last_alert = int(state.get(key, {}).get("last_alert_ts", 0) or 0)
-        if (now_ts - last_alert) > 300:  # 5 min cooldown for add-to-cart
+    # Status transition alerts (high value, low noise)
+    if status != prev_status:
+        if status == "QUEUE":
             tg_send(
-                f"🟢 POSSIBLE RESTOCK (Add to cart detected)\n"
-                f"Time: {now_utc_str()}\n"
-                f"Page: {name}\n"
-                f"Link: {final_url}"
+                f"🚨 QUEUE DETECTED\nTime: {now_utc_str()}\nSource: {name}\nLink: {final_url}\nReason: {q_reason}"
             )
             state[key]["last_alert_ts"] = now_ts
 
+        elif status == "BLOCK":
+            # Don't spam blocks; rate-limit
+            if should_realert(state, key, now_ts, ERROR_RE_ALERT_SECONDS):
+                tg_send(
+                    f"🧱 POSSIBLE BLOCK/CAPTCHA\nTime: {now_utc_str()}\nSource: {name}\nLink: {final_url}\nReason: {b_reason}"
+                )
+                state[key]["last_alert_ts"] = now_ts
+
+        elif status == "OK" and prev_status == "QUEUE":
+            tg_send(
+                f"✅ QUEUE CLEARED\nTime: {now_utc_str()}\nSource: {name}\nLink: {final_url}"
+            )
+            state[key]["last_alert_ts"] = now_ts
+
+    # Wait-time thresholds (only when QUEUE)
+    if status == "QUEUE":
+        wait_seconds = parse_wait_time_seconds(body_text)
+        if wait_seconds is not None:
+            hours = wait_seconds / 3600.0
+
+            th_key = stable_key("wait_thresholds", source_url)
+            passed = set(state.get(th_key, {}).get("passed", []))
+
+            for th in sorted(WAITTIME_THRESHOLDS_HOURS, reverse=True):
+                # alert when it drops BELOW threshold for first time
+                if hours <= th and str(th) not in passed:
+                    tg_send(
+                        f"⏱ WAIT TIME DROP\nTime: {now_utc_str()}\nSource: {name}\nWait: ~{hours:.2f}h (<= {th}h)\nLink: {final_url}"
+                    )
+                    passed.add(str(th))
+
+            state[th_key] = {"passed": sorted(list(passed)), "last_seen_ts": now_ts}
+
+        # Optional re-alert if queue stays active forever (hourly)
+        if should_realert(state, stable_key("queue_realert", source_url), now_ts, RE_ALERT_SECONDS):
+            tg_send(
+                f"🔁 QUEUE STILL ACTIVE\nTime: {now_utc_str()}\nSource: {name}\nLink: {final_url}"
+            )
+            state[stable_key("queue_realert", source_url)] = {"last_alert_ts": now_ts}
+
+
+def stock_alerts(
+    state: dict,
+    now_ts: int,
+    name: str,
+    source_url: str,
+    final_url: str,
+    body_text: str,
+    html: str,
+    is_product: bool,
+) -> None:
+    """
+    Upgrade #2: Noise reduction.
+      - For categories: only alert on strong signals (add_to_cart appearing) or major signature changes (rare).
+      - For products: alert on add_to_cart and out_of_stock->false transitions.
+    Upgrade #4: Sniping mode.
+      - "Add to cart detected" sends immediately with cooldown.
+    """
+    key = stable_key("stock", source_url)
+    prev = state.get(key, {})
+    prev_signals = prev.get("signals", {})
+    prev_add = bool(prev_signals.get("add_to_cart", False))
+    prev_oos = bool(prev_signals.get("out_of_stock", False))
+
+    signals = detect_stock_signals(html, body_text)
+    add_to_cart = signals["add_to_cart"]
+    out_of_stock = signals["out_of_stock"]
+
+    title = extract_title(html)
+
+    # Build a conservative signature (reduces noise):
+    # - We do NOT hash full HTML.
+    # - We hash just these booleans + title.
+    sig = stable_key(str(add_to_cart), str(out_of_stock), title)
+
+    # Store baseline
+    first_seen = prev.get("sig") is None
     state[key] = {
-        "sig": signature,
+        "sig": sig,
         "signals": signals,
         "final_url": final_url,
         "last_seen_ts": now_ts,
-        "last_alert_ts": state.get(key, {}).get("last_alert_ts", 0),
+        "last_alert_ts": prev.get("last_alert_ts", 0),
+        "title": title,
     }
+
+    # -------------------
+    # SNIPE: Add-to-cart detected (strong)
+    # -------------------
+    if add_to_cart:
+        last_alert = int(state[key].get("last_alert_ts", 0) or 0)
+        if (now_ts - last_alert) > SNIPE_COOLDOWN_SECONDS:
+            tg_send(
+                f"🟢 ADD TO CART DETECTED (SNIPE)\n"
+                f"Time: {now_utc_str()}\n"
+                f"Target: {name}\n"
+                f"Title: {title or 'N/A'}\n"
+                f"Link: {final_url}"
+            )
+            state[key]["last_alert_ts"] = now_ts
+        return  # if add-to-cart is true we don't need other noisy alerts
+
+    # -------------------
+    # PRODUCT: out_of_stock -> not out_of_stock (restock hint)
+    # -------------------
+    if is_product and prev_oos and (not out_of_stock) and (not first_seen):
+        tg_send(
+            f"📦 RESTOCK SIGNAL (OOS cleared)\n"
+            f"Time: {now_utc_str()}\n"
+            f"Target: {name}\n"
+            f"Title: {title or 'N/A'}\n"
+            f"Link: {final_url}"
+        )
+        state[key]["last_alert_ts"] = now_ts
+        return
+
+    # -------------------
+    # CATEGORY: only alert if add-to-cart appears (handled above) or major signature change
+    # PRODUCT: optionally alert on major signature changes too
+    # -------------------
+    prev_sig = prev.get("sig")
+    if (not first_seen) and prev_sig and prev_sig != sig:
+        # Noise reduction:
+        # - categories: do NOT alert for small changes unless this is a product page
+        if is_product:
+            tg_send(
+                f"🧩 PRODUCT PAGE CHANGED\n"
+                f"Time: {now_utc_str()}\n"
+                f"Target: {name}\n"
+                f"Title: {title or 'N/A'}\n"
+                f"Link: {final_url}\n"
+                f"Now: out_of_stock={out_of_stock} | add_to_cart={add_to_cart}"
+            )
+            state[key]["last_alert_ts"] = now_ts
+        else:
+            # categories: silence; just keep baseline updated
+            pass
 
 
 def main():
     now_ts = int(time.time())
     state = load_state()
 
-    # --- Quick connection test (kept lightweight) ---
-    tg_send("🧪 PokeWonder live — monitor cycle started.")
+    # Upgrade #1: daily-only alive message
+    daily_alive(state, now_ts)
 
-    targets = [
+    # Targets
+    category_targets = [
         ("PC UK Home", PC_UK_HOME),
         ("PC UK TCG Category", PC_UK_TCG),
         ("PC UK New Releases", PC_UK_NEW),
     ]
+    product_targets = [(f"Product {i}", u) for i, u in enumerate(PRODUCT_URLS, start=1)]
 
-    # Add product targets
-    for i, u in enumerate(PRODUCT_URLS, start=1):
-        targets.append((f"Product {i}", u))
+    # If user hasn't provided product URLs yet, still run categories
+    targets = [(n, u, False) for (n, u) in category_targets] + [(n, u, True) for (n, u) in product_targets]
 
-    for name, url in targets:
+    for name, url, is_product in targets:
         try:
             res = browser_fetch(url)
             final_url = res["final_url"]
             body_text = res["body_text"]
             html = res["html"]
 
-            # Queue detection & alerts
-            alert_queue_changes(state, now_ts, name, url, final_url, body_text)
+            # Upgrade #3: advanced queue detection + wait-time thresholds + block detection
+            queue_alerts(state, now_ts, name, url, final_url, body_text)
 
-            # Stock-style change detection (categories + products)
-            alert_stock_changes(state, now_ts, name, url, final_url, body_text, html)
+            # Upgrade #2 + #4: noise-reduced stock alerts + sniping mode
+            stock_alerts(state, now_ts, name, url, final_url, body_text, html, is_product=is_product)
 
             print(f"Checked {name} OK -> {final_url}")
 
         except Exception as e:
-            # On errors, alert but don't spam
             err_key = stable_key("error", url)
-            if should_realert(state, err_key, now_ts):
+            if should_realert(state, err_key, now_ts, ERROR_RE_ALERT_SECONDS):
                 tg_send(
                     f"⚠️ MONITOR ERROR\n"
                     f"Time: {now_utc_str()}\n"
@@ -322,7 +482,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
