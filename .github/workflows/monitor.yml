@@ -5,13 +5,6 @@ on:
   schedule:
     - cron: "*/5 * * * *"
 
-concurrency:
-  group: pokewonder-monitor
-  cancel-in-progress: true
-
-permissions:
-  contents: write
-
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -37,9 +30,8 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          # OPTIONAL: customise filters (comma-separated)
-          # Example: elite trainer box,booster box,151,prismatic evolutions
           KEYWORDS: ${{ secrets.KEYWORDS }}
+          SEND_SUMMARY: ${{ secrets.SEND_SUMMARY }}
 
       - name: Save state
         run: |
