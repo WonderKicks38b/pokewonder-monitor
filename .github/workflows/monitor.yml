@@ -3,12 +3,16 @@ name: PokeWonder Monitor
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes (UTC)
+    - cron: "*/5 * * * *"   # every 5 minutes (GitHub minimum)
+
+concurrency:
+  group: pokewonder-monitor
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
 
     steps:
       - name: Checkout
@@ -22,16 +26,22 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests playwright
+          pip install playwright requests
           python -m playwright install --with-deps chromium
 
       - name: Run monitor
-        run: python check_stock.py
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+
+          # Optional secrets (create these if you want):
+          WATCH_KEYWORDS: ${{ secrets.WATCH_KEYWORDS }}
           WATCH_URLS: ${{ secrets.WATCH_URLS }}
-          KEYWORDS: ${{ secrets.KEYWORDS }}
+          SET_NAMES: ${{ secrets.SET_NAMES }}
+
+          ALERT_ONLY_ON_MATCH: ${{ secrets.ALERT_ONLY_ON_MATCH }}
+          SEND_SUMMARY: ${{ secrets.SEND_SUMMARY }}
+        run: python check_stock.py
 
       - name: Save state
         run: |
