@@ -3,11 +3,7 @@ name: PokeWonder Monitor
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes (GitHub minimum)
-
-concurrency:
-  group: pokewonder-monitor
-  cancel-in-progress: true
+    - cron: "*/7 * * * *"  # every 7 minutes
 
 jobs:
   run:
@@ -23,25 +19,23 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install system deps (Xvfb)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install playwright requests
+          pip install requests playwright playwright-stealth
           python -m playwright install --with-deps chromium
 
-      - name: Run monitor
+      - name: Run monitor (headed via Xvfb)
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-
-          # Optional secrets (create these if you want):
-          WATCH_KEYWORDS: ${{ secrets.WATCH_KEYWORDS }}
-          WATCH_URLS: ${{ secrets.WATCH_URLS }}
-          SET_NAMES: ${{ secrets.SET_NAMES }}
-
-          ALERT_ONLY_ON_MATCH: ${{ secrets.ALERT_ONLY_ON_MATCH }}
-          SEND_SUMMARY: ${{ secrets.SEND_SUMMARY }}
-        run: python check_stock.py
+        run: |
+          xvfb-run -a python check_stock.py
 
       - name: Save state
         run: |
