@@ -2,7 +2,7 @@
   "d0f13ee2b4f6d150": {
     "status": "OK",
     "final_url": "https://www.pokemoncenter.com/en-gb",
-    "last_seen_ts": 1771448072
+    "last_seen_ts": 1771448558
   },
   "77bc4b4b25aa8e98": {
     "sig": "9fc710bcc6625e8e",
@@ -18,7 +18,7 @@
   "f7fd17ad532c5f85": {
     "status": "OK",
     "final_url": "https://www.pokemoncenter.com/en-gb/category/trading-card-game",
-    "last_seen_ts": 1771448072
+    "last_seen_ts": 1771448558
   },
   "00f682f5b683d8a7": {
     "sig": "0dae7fc25d6428b8",
@@ -34,7 +34,7 @@
   "83d3e13cebe381f4": {
     "status": "OK",
     "final_url": "https://www.pokemoncenter.com/en-gb/new-releases",
-    "last_seen_ts": 1771448072
+    "last_seen_ts": 1771448558
   },
   "ee2162121276fce1": {
     "sig": "0dae7fc25d6428b8",
@@ -82,5 +82,6 @@
     "last_seen_ts": 1771448072,
     "last_alert_ts": 0,
     "title": ""
-  }
+  },
+  "items": {}
 }
