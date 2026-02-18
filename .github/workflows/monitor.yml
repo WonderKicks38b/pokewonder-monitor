@@ -37,11 +37,9 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          # OPTIONAL:
-          # Put product URLs (comma-separated) in a repo secret named PRODUCT_URLS if you want true restock sniping
-          PRODUCT_URLS: ${{ secrets.PRODUCT_URLS }}
-          # OPTIONAL: override wait-time thresholds (hours)
-          WAIT_THRESHOLDS: ${{ secrets.WAIT_THRESHOLDS }}
+          # OPTIONAL: customise filters (comma-separated)
+          # Example: elite trainer box,booster box,151,prismatic evolutions
+          KEYWORDS: ${{ secrets.KEYWORDS }}
 
       - name: Save state
         run: |
