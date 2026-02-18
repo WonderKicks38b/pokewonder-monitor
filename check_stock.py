@@ -6,17 +6,15 @@ from datetime import datetime, timezone
 
 STATE_PATH = "state.json"
 
-BASE_API = "https://www.pokemoncenter.com/api/search"
-
-DEFAULT_KEYWORDS = [
-    "etb",
+TARGET_KEYWORDS = [
     "elite trainer box",
+    "etb",
     "booster box",
     "booster bundle",
     "premium collection",
     "special collection",
     "destined rivals",
-    "ascended heroes",
+    "ascended heroes"
 ]
 
 HEADERS = {
@@ -48,62 +46,83 @@ def tg_send(text):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     requests.post(url, data={"chat_id": chat_id, "text": text})
 
-def keyword_match(title, keywords):
+def keyword_match(title):
     t = title.lower()
-    return any(k.lower() in t for k in keywords)
+    return any(k in t for k in TARGET_KEYWORDS)
 
-def search_api(query):
-    params = {
-        "q": query,
-        "locale": "en-gb"
-    }
-    r = requests.get(BASE_API, headers=HEADERS, params=params, timeout=20)
+def get_build_id():
+    r = requests.get("https://www.pokemoncenter.com/en-gb", headers=HEADERS)
     if r.status_code != 200:
-        return []
-    data = r.json()
-    results = []
-    for item in data.get("results", []):
-        title = item.get("name")
-        url = item.get("url")
-        if title and url:
-            if not url.startswith("http"):
-                url = "https://www.pokemoncenter.com" + url
-            results.append({
-                "title": title,
-                "url": url
-            })
-    return results
+        return None
+    marker = '"buildId":"'
+    if marker not in r.text:
+        return None
+    return r.text.split(marker)[1].split('"')[0]
+
+def fetch_home_data(build_id):
+    url = f"https://www.pokemoncenter.com/_next/data/{build_id}/en-gb.json"
+    r = requests.get(url, headers=HEADERS)
+    if r.status_code != 200:
+        return None
+    return r.json()
+
+def extract_products(data):
+    products = []
+    try:
+        page_props = data["pageProps"]
+        for section in page_props.values():
+            if isinstance(section, dict):
+                for v in section.values():
+                    if isinstance(v, list):
+                        for item in v:
+                            if isinstance(item, dict):
+                                name = item.get("name")
+                                url = item.get("url")
+                                if name and url:
+                                    if not url.startswith("http"):
+                                        url = "https://www.pokemoncenter.com" + url
+                                    products.append({
+                                        "title": name,
+                                        "url": url
+                                    })
+    except:
+        pass
+    return products
 
 def main():
-    keywords = DEFAULT_KEYWORDS
     state = load_state()
-
-    total_found = 0
-    new_hits = 0
 
     summary = [f"📊 PokeWonder scan summary — {now_utc()}"]
 
-    for keyword in keywords:
-        try:
-            products = search_api(keyword)
-            total_found += len(products)
+    build_id = get_build_id()
+    if not build_id:
+        tg_send("⚠️ Could not retrieve build ID.")
+        return
 
-            for p in products:
-                if not keyword_match(p["title"], keywords):
-                    continue
+    data = fetch_home_data(build_id)
+    if not data:
+        tg_send("⚠️ Could not fetch Next.js data.")
+        return
 
-                key = p["url"]
-                if key not in state:
-                    state[key] = int(time.time())
-                    new_hits += 1
-                    tg_send(f"🔥 MATCH FOUND\n{p['title']}\n{p['url']}")
+    products = extract_products(data)
 
-        except:
-            continue
+    found = 0
+    new_hits = 0
+
+    for p in products:
+        if keyword_match(p["title"]):
+            found += 1
+            if p["url"] not in state:
+                state[p["url"]] = int(time.time())
+                new_hits += 1
+                tg_send(f"🔥 NEW MATCH\n{p['title']}\n{p['url']}")
 
     save_state(state)
 
-    summary.append(f"Totals: found={total_found} new={new_hits}")
+    summary.append(f"Totals: found={found} new={new_hits}")
+
+    if found == 0:
+        summary.append("⚠️ No keyword matches found on homepage.")
 
     tg_send("\n".join(summary))
 
