@@ -3,7 +3,7 @@ name: PokeWonder Monitor
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/5 * * * *"   # every 5 minutes (UTC)
 
 jobs:
   run:
@@ -30,8 +30,8 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          WATCH_URLS: ${{ secrets.WATCH_URLS }}
           KEYWORDS: ${{ secrets.KEYWORDS }}
-          SEND_SUMMARY: ${{ secrets.SEND_SUMMARY }}
 
       - name: Save state
         run: |
